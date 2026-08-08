@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff
+        run: ruff check .
+
+      - name: pytest (fake clientset, no cluster needed)
+        run: pytest -v
+
+  kind-integration-test:
+    runs-on: ubuntu-latest
+    needs: lint-and-unit-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: deploy the deliberately-broken demo app
+        run: kubectl apply -f demo/flaky-app.yaml
+
+      - name: run the controller for a fixed number of cycles against the real cluster
+        run: |
+          python -m multicloud_healer.controller \
+            --namespace default \
+            --label-selector app=flaky-app \
+            --failure-threshold 3 \
+            --poll-interval 2 \
+            --cycles 6
+
+      - name: confirm the controller actually restarted the stuck pod
+        run: |
+          kubectl get events --field-selector reason=Killing -o wide | grep flaky-app
