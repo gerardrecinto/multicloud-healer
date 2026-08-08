@@ -1,0 +1,32 @@
+# Deliberately broken deployment for the demo: the container passes its
+# liveness probe's TCP check but never actually listens on that port, so
+# kubelet marks it not-ready and it never becomes healthy. That's the
+# "stuck unhealthy pod" scenario multicloud-healer's pod remediation is for,
+# separate from a plain container crash loop that kubelet already handles by
+# itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flaky-app
+  labels:
+    app: flaky-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flaky-app
+  template:
+    metadata:
+      labels:
+        app: flaky-app
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          readinessProbe:
+            tcpSocket:
+              port: 9999
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            failureThreshold: 1
