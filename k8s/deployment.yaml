@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multicloud-healer
+  labels:
+    app: multicloud-healer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multicloud-healer
+  template:
+    metadata:
+      labels:
+        app: multicloud-healer
+    spec:
+      serviceAccountName: multicloud-healer
+      containers:
+        - name: multicloud-healer
+          image: multicloud-healer:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--namespace=default"
+            - "--label-selector=app=flaky-app"
+            - "--failure-threshold=3"
+            - "--poll-interval=10"
+            - "--watch-nodes"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
