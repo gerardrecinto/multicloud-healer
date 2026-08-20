@@ -101,6 +101,15 @@ kubeconfig, so the same binary runs both ways.
 | `--poll-interval` | `5.0` | seconds between checks |
 | `--cycles` | `0` (forever) | stop after N cycles, used by the demo and CI |
 | `--watch-nodes` | off | also watch node Ready conditions and cordon+drain on failure |
+| `--dry-run` | off | log what would be remediated without calling the mutating API (restart/cordon/drain) |
+| `--max-remediations` | unlimited | give up on a pod/node after this many remediation attempts without a full recovery in between, instead of restarting or draining it forever |
+
+`--max-remediations` exists because the consecutive-failure threshold alone
+doesn't stop a restart storm: a pod with a bad image or a node with failing
+hardware will just fail the same way again right after being remediated,
+forever. Past the limit the controller logs it and stops touching that
+pod/node until it actually recovers on its own (the attempt count clears the
+moment a poll sees it healthy again).
 
 ## Tests
 
@@ -109,7 +118,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-All 32 tests use a fake `CoreV1Api` (`unittest.mock.MagicMock`) plus real
+All 38 tests use a fake `CoreV1Api` (`unittest.mock.MagicMock`) plus real
 `kubernetes.client` model objects (`V1Pod`, `V1Node`, ...), so they run with
 no cluster and no network. CI additionally runs a `kind` integration job
 (`.github/workflows/ci.yml`) that creates a real cluster, deploys
