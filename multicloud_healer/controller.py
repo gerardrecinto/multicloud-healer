@@ -32,13 +32,21 @@ class SelfHealingController:
         label_selector: str,
         failure_threshold: int,
         watch_nodes: bool = False,
+        dry_run: bool = False,
+        max_remediations: int | None = None,
     ) -> None:
+        if max_remediations is not None and max_remediations < 1:
+            raise ValueError("max_remediations must be at least 1 if set")
         self.api = api
         self.namespace = namespace
         self.label_selector = label_selector
         self.watch_nodes = watch_nodes
+        self.dry_run = dry_run
+        self.max_remediations = max_remediations
         self.pod_tracker = ConsecutiveFailureTracker(failure_threshold)
         self.node_tracker = ConsecutiveFailureTracker(failure_threshold)
+        self._pod_remediation_attempts: dict[str, int] = {}
+        self._node_remediation_attempts: dict[str, int] = {}
 
     def poll_pods(self) -> list[str]:
         pods = self.api.list_namespaced_pod(self.namespace, label_selector=self.label_selector).items
@@ -46,13 +54,35 @@ class SelfHealingController:
         for pod in pods:
             key = f"{pod.metadata.namespace}/{pod.metadata.name}"
             healthy = pod_is_healthy(pod)
+            if healthy:
+                self._pod_remediation_attempts.pop(key, None)
             if self.pod_tracker.record(key, healthy):
-                logger.warning(
-                    "pod %s unhealthy for %d consecutive checks, restarting",
-                    key,
-                    self.pod_tracker.threshold,
-                )
-                restart_pod(self.api, pod.metadata.namespace, pod.metadata.name)
+                attempts = self._pod_remediation_attempts.get(key, 0) + 1
+                if self.max_remediations is not None and attempts > self.max_remediations:
+                    logger.error(
+                        "pod %s unhealthy again after %d remediation attempts, giving up "
+                        "(max-remediations=%d), not restarting again",
+                        key,
+                        attempts - 1,
+                        self.max_remediations,
+                    )
+                    continue
+                self._pod_remediation_attempts[key] = attempts
+                if self.dry_run:
+                    logger.warning(
+                        "DRY RUN: pod %s unhealthy for %d consecutive checks, would restart (attempt %d)",
+                        key,
+                        self.pod_tracker.threshold,
+                        attempts,
+                    )
+                else:
+                    logger.warning(
+                        "pod %s unhealthy for %d consecutive checks, restarting (attempt %d)",
+                        key,
+                        self.pod_tracker.threshold,
+                        attempts,
+                    )
+                    restart_pod(self.api, pod.metadata.namespace, pod.metadata.name)
                 self.pod_tracker.reset(key)
                 remediated.append(key)
         return remediated
@@ -65,17 +95,43 @@ class SelfHealingController:
         for node in nodes:
             name = node.metadata.name
             healthy = node_is_healthy(node)
+            if healthy:
+                self._node_remediation_attempts.pop(name, None)
             if self.node_tracker.record(name, healthy):
                 labels = node.metadata.labels or {}
                 provider = detect_provider(labels)
                 meta = provider.node_metadata(labels)
-                logger.warning(
-                    "node %s (%s) unhealthy for %d consecutive checks, cordoning and draining",
-                    name,
-                    meta.cloud,
-                    self.node_tracker.threshold,
-                )
-                cordon_and_drain_node(self.api, name)
+                attempts = self._node_remediation_attempts.get(name, 0) + 1
+                if self.max_remediations is not None and attempts > self.max_remediations:
+                    logger.error(
+                        "node %s (%s) unhealthy again after %d remediation attempts, giving up "
+                        "(max-remediations=%d), not cordoning again",
+                        name,
+                        meta.cloud,
+                        attempts - 1,
+                        self.max_remediations,
+                    )
+                    continue
+                self._node_remediation_attempts[name] = attempts
+                if self.dry_run:
+                    logger.warning(
+                        "DRY RUN: node %s (%s) unhealthy for %d consecutive checks, would cordon "
+                        "and drain (attempt %d)",
+                        name,
+                        meta.cloud,
+                        self.node_tracker.threshold,
+                        attempts,
+                    )
+                else:
+                    logger.warning(
+                        "node %s (%s) unhealthy for %d consecutive checks, cordoning and draining "
+                        "(attempt %d)",
+                        name,
+                        meta.cloud,
+                        self.node_tracker.threshold,
+                        attempts,
+                    )
+                    cordon_and_drain_node(self.api, name)
                 self.node_tracker.reset(name)
                 remediated.append(name)
         return remediated
@@ -115,6 +171,18 @@ def main() -> None:
     parser.add_argument("--poll-interval", type=float, default=5.0)
     parser.add_argument("--cycles", type=int, default=0, help="0 means run forever")
     parser.add_argument("--watch-nodes", action="store_true")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="log what would be remediated without calling the mutating API (restart/cordon/drain)",
+    )
+    parser.add_argument(
+        "--max-remediations",
+        type=int,
+        default=None,
+        help="give up on a pod/node after this many remediation attempts without a full recovery "
+        "in between, default unlimited",
+    )
     args = parser.parse_args()
 
     api = build_api(args.context)
@@ -124,13 +192,18 @@ def main() -> None:
         label_selector=args.label_selector,
         failure_threshold=args.failure_threshold,
         watch_nodes=args.watch_nodes,
+        dry_run=args.dry_run,
+        max_remediations=args.max_remediations,
     )
     logger.info(
-        "starting controller: namespace=%s selector=%r threshold=%d watch_nodes=%s",
+        "starting controller: namespace=%s selector=%r threshold=%d watch_nodes=%s dry_run=%s "
+        "max_remediations=%s",
         args.namespace,
         args.label_selector,
         args.failure_threshold,
         args.watch_nodes,
+        args.dry_run,
+        args.max_remediations,
     )
     controller.run(args.poll_interval, cycles=args.cycles)
 

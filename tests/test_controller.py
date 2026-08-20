@@ -109,3 +109,117 @@ def test_poll_nodes_cordons_and_drains_after_threshold():
 
     assert remediated == ["node-1"]
     api.patch_node.assert_called_once_with("node-1", {"spec": {"unschedulable": True}})
+
+
+def test_dry_run_reports_but_does_not_call_mutating_api():
+    api = MagicMock()
+    api.list_namespaced_pod.return_value.items = [_unhealthy_pod("flaky-app-1")]
+
+    controller = SelfHealingController(
+        api=api,
+        namespace="default",
+        label_selector="app=flaky-app",
+        failure_threshold=1,
+        dry_run=True,
+    )
+
+    remediated = controller.poll_pods()
+
+    assert remediated == ["default/flaky-app-1"]
+    api.delete_namespaced_pod.assert_not_called()
+
+
+def test_dry_run_keeps_reporting_on_repeated_threshold_crossings():
+    api = MagicMock()
+    api.list_namespaced_pod.return_value.items = [_unhealthy_pod("flaky-app-1")]
+
+    controller = SelfHealingController(
+        api=api,
+        namespace="default",
+        label_selector="app=flaky-app",
+        failure_threshold=1,
+        dry_run=True,
+    )
+
+    assert controller.poll_pods() == ["default/flaky-app-1"]
+    assert controller.poll_pods() == ["default/flaky-app-1"]
+    api.delete_namespaced_pod.assert_not_called()
+
+
+def test_max_remediations_gives_up_after_limit_without_recovery():
+    api = MagicMock()
+    api.list_namespaced_pod.return_value.items = [_unhealthy_pod("flaky-app-1")]
+
+    controller = SelfHealingController(
+        api=api,
+        namespace="default",
+        label_selector="app=flaky-app",
+        failure_threshold=1,
+        max_remediations=2,
+    )
+
+    assert controller.poll_pods() == ["default/flaky-app-1"]
+    assert controller.poll_pods() == ["default/flaky-app-1"]
+    assert controller.poll_pods() == []
+    assert controller.poll_pods() == []
+    assert api.delete_namespaced_pod.call_count == 2
+
+
+def test_max_remediations_resets_after_a_real_recovery():
+    api = MagicMock()
+    healthy = _healthy_pod("flaky-app-1")
+    unhealthy = _unhealthy_pod("flaky-app-1")
+
+    controller = SelfHealingController(
+        api=api,
+        namespace="default",
+        label_selector="app=flaky-app",
+        failure_threshold=1,
+        max_remediations=1,
+    )
+
+    api.list_namespaced_pod.return_value.items = [unhealthy]
+    assert controller.poll_pods() == ["default/flaky-app-1"]
+    assert controller.poll_pods() == []  # limit hit, gives up
+
+    api.list_namespaced_pod.return_value.items = [healthy]
+    assert controller.poll_pods() == []  # recovers, attempt count clears
+
+    api.list_namespaced_pod.return_value.items = [unhealthy]
+    assert controller.poll_pods() == ["default/flaky-app-1"]  # allowed to try again
+    assert api.delete_namespaced_pod.call_count == 2
+
+
+def test_max_remediations_below_one_rejected():
+    api = MagicMock()
+    try:
+        SelfHealingController(
+            api=api, namespace="default", label_selector="", failure_threshold=1, max_remediations=0
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_dry_run_applies_to_nodes_too():
+    api = MagicMock()
+    unhealthy_node = V1Node(
+        metadata=V1ObjectMeta(name="node-1", labels={"eks.amazonaws.com/nodegroup": "pool-a"}),
+        status=V1NodeStatus(conditions=[V1NodeCondition(type="Ready", status="False")]),
+    )
+    api.list_node.return_value.items = [unhealthy_node]
+
+    controller = SelfHealingController(
+        api=api,
+        namespace="default",
+        label_selector="",
+        failure_threshold=1,
+        watch_nodes=True,
+        dry_run=True,
+    )
+
+    remediated = controller.poll_nodes()
+
+    assert remediated == ["node-1"]
+    api.patch_node.assert_not_called()
+    api.list_pod_for_all_namespaces.assert_not_called()
